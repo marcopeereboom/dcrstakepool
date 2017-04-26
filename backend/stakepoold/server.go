@@ -5,6 +5,7 @@
 package main
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"github.com/decred/dcrd/chaincfg"
 	"github.com/decred/dcrd/chaincfg/chainhash"
 	"github.com/decred/dcrd/dcrjson"
+	"github.com/decred/dcrd/wire"
 	"github.com/decred/dcrrpcclient"
 	"github.com/decred/dcrstakepool/backend/stakepoold/userdata"
 	"github.com/decred/dcrstakepool/backend/stakepoold/voteoptions"
@@ -330,20 +332,6 @@ func (ctx *appContext) loadData() {
 	defer ctx.Unlock()
 }
 
-func (ctx *appContext) sendTickets(blockHash, ticket *chainhash.Hash, msa string, height int64) error {
-	sstx, err := walletCreateVote(ctx, blockHash, height, ticket, msa)
-	if err != nil {
-		return fmt.Errorf("failed to create vote: %v", err)
-	}
-
-	_, err = nodeSendVote(ctx, sstx)
-	if err != nil {
-		return fmt.Errorf("failed to vote: %v", err)
-	}
-
-	return nil
-}
-
 func (ctx *appContext) processWinningTickets(wt WinningTicketsForBlock) {
 	// We always have to reload so signal the other end on the way out.
 	// Maybe we can change this to a go routine so that we are not gated on
@@ -362,11 +350,17 @@ func (ctx *appContext) processWinningTickets(wt WinningTicketsForBlock) {
 		}
 	}()
 
+	type winner struct {
+		msa    string                    // multisig
+		ticket chainhash.Hash            // Willy Wonka
+		config userdata.UserVotingConfig // voting config
+	}
+	winners := make([]winner, 0, len(wt.winningTickets))
+
+	ctx.RLock()
 	for _, ticket := range wt.winningTickets {
 		// Look up multi sig address.
-		ctx.RLock()
 		msa, ok := ctx.ticketsMSA[*ticket]
-		ctx.RUnlock()
 		if !ok {
 			log.Debugf("unmanaged winning ticket: %v", ticket)
 			if ctx.testing {
@@ -375,18 +369,67 @@ func (ctx *appContext) processWinningTickets(wt WinningTicketsForBlock) {
 			continue
 		}
 
+		voteCfg, ok := ctx.userVotingConfig[msa]
+		if !ok {
+			// Use defaults if not found.
+			log.Infof("vote config not found for %v using default",
+				msa)
+			voteCfg = ctx.votingConfig
+		} else {
+			// If the user's voting config has a vote version that
+			// is different from our global vote version that we
+			// plucked from dcrwallet walletinfo then just use the
+			// default votebits.
+			if voteCfg.VoteBitsVersion !=
+				ctx.votingConfig.VoteVersion {
+
+				voteCfg.VoteBits = ctx.votingConfig.VoteBits
+				log.Infof("userid %v multisigaddress %v vote "+
+					"version mismatch user %v stakepoold "+
+					"%v using votebits %d",
+					voteCfg.Userid, voteCfg.MultiSigAddress,
+					voteCfg.VoteBitsVersion,
+					ctx.votingConfig.VoteVersion,
+					cfg.VoteBits)
+			}
+		}
+
+		winners = append(winners, winner{
+			msa:    msa,
+			ticket: *ticket,
+			config: voteCfg,
+		})
+	}
+	ctx.RUnlock()
+
+	// When testing we don't send the tickets.
+	if ctx.testing {
+		return
+	}
+
+	for _, w := range winners {
 		log.Infof("winning ticket %v height %v block hash %v msa %v",
 			ticket, wt.blockHeight, wt.blockHash, msa)
 
-		// When testing we don't send the tickets.
-		if ctx.testing {
-			continue
+		res, err := ctx.walletConnection.GenerateVote(blockHash, blockHeight,
+			ticketHash, voteBits, ctx.votingConfig.VoteBitsExtended)
+		if err != nil {
+			return "", err // XXX
+		}
+		return res.Hex, nil
+
+		buf, err := hex.DecodeString(hexTx)
+		if err != nil {
+			log.Errorf("DecodeString failed: %v", err)
+			return nil, err
+		}
+		newTx := wire.NewMsgTx()
+		err = newTx.FromBytes(buf)
+		if err != nil {
+			return nil, err
 		}
 
-		err := ctx.sendTickets(wt.blockHash, ticket, msa, wt.blockHeight)
-		if err != nil {
-			log.Infof("%v", err)
-		}
+		return ctx.nodeConnection.SendRawTransaction(newTx, false)
 	}
 }
 
